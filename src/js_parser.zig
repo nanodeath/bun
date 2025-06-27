@@ -10629,7 +10629,7 @@ fn NewParser_(
                                     },
                                     .ts_stmt_interface => {
                                         // "interface Foo {}"
-                                        var stmtOpts = ParseStatementOptions{ .is_module_scope = opts.is_module_scope };
+                                        var stmtOpts = ParseStatementOptions{ .is_module_scope = opts.is_module_scope, .is_export = opts.is_export };
 
                                         try p.skipTypeScriptInterfaceStmt(&stmtOpts);
                                         return p.s(S.TypeScript{}, loc);
@@ -11030,10 +11030,17 @@ fn NewParser_(
 
         fn skipTypeScriptInterfaceStmt(p: *P, opts: *ParseStatementOptions) anyerror!void {
             const name = p.lexer.identifier;
+            const name_loc = p.lexer.loc();
             try p.lexer.expect(.t_identifier);
 
             if (opts.is_module_scope) {
                 p.local_type_names.put(p.allocator, name, true) catch unreachable;
+            }
+
+            // Record export if this interface is exported
+            if (opts.is_export and opts.is_module_scope) {
+                const ref = try p.declareSymbol(.other, name_loc, name);
+                try p.recordExport(name_loc, name, ref);
             }
 
             _ = try p.skipTypeScriptTypeParameters(.{
