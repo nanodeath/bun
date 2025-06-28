@@ -818,6 +818,41 @@ pub export fn Bun__getDefaultLoader(global: *JSGlobalObject, str: *const bun.Str
     return loader;
 }
 
+/// Helper function to append TypeScript interface exports for runtime resolution
+/// Returns either the original source or a new source with interface exports appended
+fn appendInterfaceExports(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    named_exports: anytype,
+) ![]const u8 {
+    if (named_exports.count() == 0) return source;
+
+    // Build interface re-exports to make them available to JavaScriptCore
+    var interface_exports = std.ArrayList(u8).init(allocator);
+    defer interface_exports.deinit();
+
+    var export_iter = named_exports.iterator();
+    while (export_iter.next()) |entry| {
+        const export_name = entry.key_ptr.*;
+
+        // Add a runtime-accessible re-export for the interface
+        // This makes interfaces visible to JavaScriptCore's ESModule resolution
+        try interface_exports.writer().print("export const {s} = void 0;\n", .{export_name});
+    }
+
+    if (interface_exports.items.len == 0) return source;
+
+    // Append interface exports to transpiled code
+    var combined_source = std.ArrayList(u8).init(allocator);
+    defer combined_source.deinit();
+
+    try combined_source.appendSlice(source);
+    try combined_source.appendSlice("\n// TypeScript interface exports for runtime resolution\n");
+    try combined_source.appendSlice(interface_exports.items);
+
+    return try allocator.dupe(u8, combined_source.items);
+}
+
 pub fn transpileSourceCode(
     jsc_vm: *VirtualMachine,
     specifier: string,
@@ -1272,34 +1307,10 @@ pub fn transpileSourceCode(
                 const needs_interface_exports = parse_result.ast.named_exports.count() > 0 and
                     (loader == .ts or loader == .tsx);
 
-                const final_source = if (needs_interface_exports) brk: {
-                    // Build interface re-exports to make them available to JavaScriptCore
-                    var interface_exports = std.ArrayList(u8).init(jsc_vm.allocator);
-                    defer interface_exports.deinit();
-
-                    var export_iter = parse_result.ast.named_exports.iterator();
-                    while (export_iter.next()) |entry| {
-                        const export_name = entry.key_ptr.*;
-
-                        // Add a runtime-accessible re-export for the interface
-                        // This makes interfaces visible to JavaScriptCore's ESModule resolution
-                        try interface_exports.writer().print("export const {s} = void 0;\n", .{export_name});
-                    }
-
-                    if (interface_exports.items.len > 0) {
-                        // Append interface exports to transpiled code
-                        var combined_source = std.ArrayList(u8).init(jsc_vm.allocator);
-                        defer combined_source.deinit();
-
-                        try combined_source.appendSlice(written);
-                        try combined_source.appendSlice("\n// TypeScript interface exports for runtime resolution\n");
-                        try combined_source.appendSlice(interface_exports.items);
-
-                        break :brk try jsc_vm.allocator.dupe(u8, combined_source.items);
-                    } else {
-                        break :brk written;
-                    }
-                } else written;
+                const final_source = if (needs_interface_exports)
+                    try appendInterfaceExports(jsc_vm.allocator, written, parse_result.ast.named_exports)
+                else
+                    written;
 
                 var resolved_source = jsc_vm.refCountedResolvedSource(final_source, input_specifier, path.text, null, false);
                 resolved_source.is_commonjs_module = parse_result.ast.has_commonjs_export_names or parse_result.ast.exports_kind == .cjs;
@@ -1328,39 +1339,17 @@ pub fn transpileSourceCode(
 
                     // Check if we need to append interface exports for runtime resolution
                     const needs_interface_exports = parse_result.ast.named_exports.count() > 0 and
-                        loader == .ts or loader == .tsx;
+                        (loader == .ts or loader == .tsx);
 
                     if (needs_interface_exports) {
-                        // Build interface re-exports to make them available to JavaScriptCore
-                        var interface_exports = std.ArrayList(u8).init(jsc_vm.allocator);
-                        defer interface_exports.deinit();
+                        const final_source = try appendInterfaceExports(jsc_vm.allocator, written, parse_result.ast.named_exports);
+                        const result = bun.String.createUTF8(final_source);
 
-                        var export_iter = parse_result.ast.named_exports.iterator();
-                        while (export_iter.next()) |entry| {
-                            const export_name = entry.key_ptr.*;
-
-                            // Add a runtime-accessible re-export for the interface
-                            // This makes interfaces visible to JavaScriptCore's ESModule resolution
-                            try interface_exports.writer().print("export const {s} = void 0;\n", .{export_name});
+                        if (written.len > 1024 * 1024 * 2 or jsc_vm.smol) {
+                            printer.ctx.buffer.deinit();
                         }
 
-                        if (interface_exports.items.len > 0) {
-                            // Append interface exports to transpiled code
-                            var combined_source = std.ArrayList(u8).init(jsc_vm.allocator);
-                            defer combined_source.deinit();
-
-                            try combined_source.appendSlice(written);
-                            try combined_source.appendSlice("\n// TypeScript interface exports for runtime resolution\n");
-                            try combined_source.appendSlice(interface_exports.items);
-
-                            const result = bun.String.createUTF8(try jsc_vm.allocator.dupe(u8, combined_source.items));
-
-                            if (written.len > 1024 * 1024 * 2 or jsc_vm.smol) {
-                                printer.ctx.buffer.deinit();
-                            }
-
-                            break :brk result;
-                        }
+                        break :brk result;
                     }
 
                     const result = cache.output_code orelse bun.String.createLatin1(written);
